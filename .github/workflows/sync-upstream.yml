@@ -1,0 +1,53 @@
+name: Sync upstream
+
+# Fork-only: merges cursor/plugins main into this fork's main every day
+# and regenerates the Claude Code pstack tree. Opens an issue on conflicts.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    if: github.repository != 'cursor/plugins'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Merge upstream and regenerate
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set +e
+          bash fork/sync-upstream.sh --push
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Open an issue on failure
+        if: steps.sync.outputs.code != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CODE: ${{ steps.sync.outputs.code }}
+        run: |
+          title="Upstream sync needs a hand"
+          # Forks have issues off by default; the failed run still notifies you.
+          open=$(gh issue list --state open --search "$title in:title" --json number --jq 'length' 2>/dev/null || echo 0)
+          if [ "$open" = "0" ]; then
+            gh issue create --title "$title" \
+              --body "Daily sync with cursor/plugins failed (exit $CODE). Run \`fork/sync-upstream.sh --push\` locally to resolve. Log: $RUN_URL" \
+              || echo "could not open an issue (are issues enabled on the fork?)"
+          fi
+          exit 1
