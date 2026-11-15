@@ -1,11 +1,13 @@
 name: Sync upstream
 
-# Fork-only: merges cursor/plugins main into this fork's main every day
-# and regenerates the Claude Code pstack tree. Opens an issue on conflicts.
+# Fork-only: merges cursor/plugins main into this fork's main every Monday
+# and regenerates the Claude Code pstack tree. When upstream touched pstack
+# files this fork also changed, or the merge conflicts, it opens an issue with
+# both diffs. If it can't open an issue, the run fails so GitHub emails you.
 
 on:
   schedule:
-    - cron: "17 6 * * *"
+    - cron: "17 6 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -28,26 +30,53 @@ jobs:
 
       - name: Merge upstream and regenerate
         id: sync
+        env:
+          SYNC_REPORT: ${{ runner.temp }}/report.md
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           set +e
           bash fork/sync-upstream.sh --push
-          echo "code=$?" >> "$GITHUB_OUTPUT"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if grep -q '^## ' "$SYNC_REPORT" 2>/dev/null; then flag=true; else flag=false; fi
+          echo "notify=$([ "$code" != 0 ] || [ "$flag" = true ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          [ -s "$SYNC_REPORT" ] && cat "$SYNC_REPORT" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
 
-      - name: Open an issue on failure
-        if: steps.sync.outputs.code != '0'
+      - name: Report overlaps and conflicts
+        if: steps.sync.outputs.notify == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CODE: ${{ steps.sync.outputs.code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPORT: ${{ runner.temp }}/report.md
         run: |
-          title="Upstream sync needs a hand"
-          # Forks have issues off by default; the failed run still notifies you.
-          open=$(gh issue list --state open --search "$title in:title" --json number --jq 'length' 2>/dev/null || echo 0)
-          if [ "$open" = "0" ]; then
-            gh issue create --title "$title" \
-              --body "Daily sync with cursor/plugins failed (exit $CODE). Run \`fork/sync-upstream.sh --push\` locally to resolve. Log: $RUN_URL" \
-              || echo "could not open an issue (are issues enabled on the fork?)"
+          if [ "$CODE" = 2 ]; then
+            title="pstack sync: merge conflicts ($(date -u +%F))"
+            head="Upstream changed files you changed and git could not merge them. **Nothing was merged.**"
+          elif [ "$CODE" = 0 ]; then
+            title="pstack sync: upstream changed files you changed ($(date -u +%F))"
+            head="Merged and pushed. Upstream also edited files you customized; check the diffs below still do what you want."
+          else
+            title="pstack sync: failed ($(date -u +%F))"
+            head="The sync script errored (exit $CODE). See the run log."
           fi
-          exit 1
+          {
+            echo "$head"
+            echo
+            [ -s "$REPORT" ] && cat "$REPORT"
+            echo
+            echo "[run log]($RUN_URL)"
+          } > body.md
+          # Issue bodies max out at 65536 characters.
+          if [ "$(wc -c < body.md)" -gt 64000 ]; then
+            head -c 63000 body.md > b && mv b body.md
+            printf '\n\n_…cut off; the full report is on the [run page](%s)._\n' "$RUN_URL" >> body.md
+          fi
+          if gh issue create --title "$title" --body-file body.md; then
+            [ "$CODE" = 0 ] || exit 1
+          else
+            echo "::error::could not open an issue (issues may be off for this fork); the report is in this run's summary"
+            exit 1
+          fi
